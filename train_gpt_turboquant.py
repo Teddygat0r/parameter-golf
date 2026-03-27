@@ -305,8 +305,9 @@ TURBOQUANT_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 TURBOQUANT_KEEP_FLOAT_MAX_NUMEL = 65_536
 TURBOQUANT_KEEP_FLOAT_STORE_DTYPE = torch.float16
 TURBOQUANT_STORE_NORM_DTYPE = torch.float16
-TURBOQUANT_DEFAULT_MODE = os.environ.get("TURBOQUANT_MODE", "prod")
-TURBOQUANT_DEFAULT_BITS = int(os.environ.get("TURBOQUANT_BITS", 3))
+TURBOQUANT_DEFAULT_MODE = os.environ.get("TURBOQUANT_MODE", "mse")
+TURBOQUANT_DEFAULT_BITS = int(os.environ.get("TURBOQUANT_BITS", 6))
+TURBOQUANT_DEFAULT_BLOCK_SIZE = int(os.environ.get("TURBOQUANT_BLOCK_SIZE", 128))
 TURBOQUANT_ROTATION_MAX_DIM = int(os.environ.get("TURBOQUANT_ROTATION_MAX_DIM", 1024))
 TURBOQUANT_LLOYD_ITERS = int(os.environ.get("TURBOQUANT_LLOYD_ITERS", 25))
 TURBOQUANT_LLOYD_GRID_SIZE = int(os.environ.get("TURBOQUANT_LLOYD_GRID_SIZE", 8192))
@@ -317,6 +318,55 @@ _TURBOQUANT_QJL_CACHE: dict[tuple[int, int], Tensor] = {}
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
+
+def _pack_indices_to_uint8(idx: Tensor, bits: int) -> Tensor:
+    if bits < 1:
+        raise ValueError(f"bits must be >= 1, got {bits}")
+    if idx.ndim != 2:
+        raise ValueError(f"Expected idx with shape [rows, dim], got {tuple(idx.shape)}")
+    levels = 1 << bits
+    flat = idx.to(torch.int64).reshape(-1)
+    if flat.numel() == 0:
+        return torch.empty(0, dtype=torch.uint8)
+    if int(flat.min().item()) < 0 or int(flat.max().item()) >= levels:
+        raise ValueError(f"Index values must lie in [0, {levels - 1}] for bits={bits}")
+    n = int(flat.numel())
+    total_bits = n * bits
+    out = torch.zeros((total_bits + 7) // 8, dtype=torch.int64)
+    base = torch.arange(n, dtype=torch.int64) * bits
+    for b in range(bits):
+        bit_vals = (flat >> b) & 1
+        bit_pos = base + b
+        byte_idx = bit_pos >> 3
+        bit_off = bit_pos & 7
+        contrib = bit_vals << bit_off
+        out.index_add_(0, byte_idx, contrib)
+    return out.to(torch.uint8).contiguous()
+
+def _unpack_indices_from_uint8(packed: Tensor, bits: int, rows: int, dim: int) -> Tensor:
+    if bits < 1:
+        raise ValueError(f"bits must be >= 1, got {bits}")
+    if rows < 0 or dim < 0:
+        raise ValueError(f"rows and dim must be non-negative, got rows={rows}, dim={dim}")
+    if packed.ndim != 1:
+        raise ValueError(f"Expected packed idx with shape [num_bytes], got {tuple(packed.shape)}")
+    n = rows * dim
+    if n == 0:
+        return torch.empty((rows, dim), dtype=torch.int16)
+    total_bits = n * bits
+    expected_num_bytes = (total_bits + 7) // 8
+    if int(packed.numel()) != expected_num_bytes:
+        raise ValueError(
+            f"Packed idx has wrong size: got {packed.numel()} bytes, expected {expected_num_bytes} "
+            f"for rows={rows}, dim={dim}, bits={bits}"
+        )
+    bit_pos = torch.arange(total_bits, dtype=torch.int64)
+    byte_idx = bit_pos >> 3
+    bit_off = bit_pos & 7
+    bit_stream = ((packed.to(torch.int64)[byte_idx] >> bit_off) & 1).reshape(n, bits)
+    weights = (1 << torch.arange(bits, dtype=torch.int64)).reshape(1, bits)
+    flat = (bit_stream * weights).sum(dim=1).to(torch.int16)
+    return flat.reshape(rows, dim).contiguous()
 
 def _stable_name_seed(base_seed: int, name: str) -> int:
     return int((base_seed + zlib.crc32(name.encode("utf-8"))) % (2**31 - 1))
@@ -413,6 +463,7 @@ class TurboQuantMSE:
     def quantize_batch(self, x: Tensor) -> Tensor:
         if x.ndim != 2 or x.shape[1] != self.dim:
             raise ValueError(f"Expected shape [N, {self.dim}], got {tuple(x.shape)}")
+
         y = self._rotate(x.float())
         idx = torch.bucketize(y, self._boundaries).to(torch.int16).contiguous()
         return idx
@@ -488,6 +539,7 @@ def quantize_state_dict_turboquant(
     state_dict: dict[str, Tensor],
     bits: int = TURBOQUANT_DEFAULT_BITS,
     mode: str = TURBOQUANT_DEFAULT_MODE,
+    block_size: int = TURBOQUANT_DEFAULT_BLOCK_SIZE,
     rotation_seed: int = 0,
     qjl_seed: int = 0,
 ):
@@ -496,6 +548,8 @@ def quantize_state_dict_turboquant(
         raise ValueError(f"Unsupported TurboQuant mode: {mode}")
     if mode_norm == "prod" and bits < 2:
         raise ValueError("TurboQuant mode='prod' requires bits >= 2")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
     quantized: dict[str, Tensor] = {}
     quant_meta: dict[str, dict[str, object]] = {}
     dtypes: dict[str, str] = {}
@@ -545,12 +599,36 @@ def quantize_state_dict_turboquant(
         tensor_rotation_seed = _stable_name_seed(rotation_seed, name)
         tensor_qjl_seed = _stable_name_seed(qjl_seed, name)
         if mode_norm == "mse":
-            q = TurboQuantMSE(dim=dim, bits=bits, rotation_seed=tensor_rotation_seed)
-            idx = q.quantize_batch(unit)
-            quantized[f"{name}::idx"] = idx
-            quantized[f"{name}::row_norm"] = row_norms.to(dtype=TURBOQUANT_STORE_NORM_DTYPE).contiguous()
-            stats["turboquant_payload_bytes"] += tensor_nbytes(quantized[f"{name}::idx"])
-            stats["turboquant_payload_bytes"] += tensor_nbytes(quantized[f"{name}::row_norm"])
+            effective_block_size = min(int(block_size), dim)
+            block_dims = [
+                int(min(effective_block_size, dim - block_start))
+                for block_start in range(0, dim, effective_block_size)
+            ]
+            block_rotation_seeds = [
+                _stable_name_seed(
+                    tensor_rotation_seed,
+                    f"block_{block_idx}_{block_dim}",
+                )
+                for block_idx, block_dim in enumerate(block_dims)
+            ]
+            for block_idx, (block_dim, block_rotation_seed) in enumerate(zip(block_dims, block_rotation_seeds, strict=True)):
+                block_start = block_idx * effective_block_size
+                block_end = block_start + block_dim
+                block_flat = flat[:, block_start:block_end]
+                block_norms = block_flat.norm(dim=1)
+                block_safe_norms = block_norms.clamp_min(1e-12)
+                block_unit = block_flat / block_safe_norms[:, None]
+                block_zero_rows = block_norms <= 1e-12
+                if block_zero_rows.any():
+                    block_unit[block_zero_rows] = 0.0
+                q = TurboQuantMSE(dim=block_dim, bits=bits, rotation_seed=block_rotation_seed)
+                idx = q.quantize_batch(block_unit)
+                idx_key = f"{name}::idx::{block_idx}"
+                norm_key = f"{name}::row_norm::{block_idx}"
+                quantized[idx_key] = _pack_indices_to_uint8(idx, bits=bits)
+                quantized[norm_key] = block_norms.to(dtype=TURBOQUANT_STORE_NORM_DTYPE).contiguous()
+                stats["turboquant_payload_bytes"] += tensor_nbytes(quantized[idx_key])
+                stats["turboquant_payload_bytes"] += tensor_nbytes(quantized[norm_key])
             quant_meta[name] = {
                 "kind": "mse",
                 "shape": orig_shape,
@@ -558,11 +636,17 @@ def quantize_state_dict_turboquant(
                 "rows": rows,
                 "bits": bits,
                 "rotation_seed": tensor_rotation_seed,
+                "blockwise": True,
+                "block_size": int(effective_block_size),
+                "num_blocks": len(block_dims),
+                "block_dims": block_dims,
+                "block_rotation_seeds": block_rotation_seeds,
+                "idx_packed": True,
             }
         else:
             q = TurboQuantProd(dim=dim, bits=bits, rotation_seed=tensor_rotation_seed, qjl_seed=tensor_qjl_seed)
             payload = q.quantize_batch(unit)
-            quantized[f"{name}::idx"] = payload["idx"]
+            quantized[f"{name}::idx"] = _pack_indices_to_uint8(payload["idx"], bits=bits - 1)
             quantized[f"{name}::qjl"] = payload["qjl"]
             quantized[f"{name}::gamma"] = payload["gamma"].to(dtype=TURBOQUANT_STORE_NORM_DTYPE).contiguous()
             quantized[f"{name}::row_norm"] = row_norms.to(dtype=TURBOQUANT_STORE_NORM_DTYPE).contiguous()
@@ -578,11 +662,12 @@ def quantize_state_dict_turboquant(
                 "bits": bits,
                 "rotation_seed": tensor_rotation_seed,
                 "qjl_seed": tensor_qjl_seed,
+                "idx_packed": True,
             }
         dtypes[name] = str(t.dtype).removeprefix("torch.")
 
     obj: dict[str, object] = {
-        "__quant_format__": "turboquant_v1",
+        "__quant_format__": "turboquant_v3",
         "mode": mode_norm,
         "bits": bits,
         "quantized": quantized,
@@ -596,6 +681,9 @@ def quantize_state_dict_turboquant(
 
 def dequantize_state_dict_turboquant(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
+    quant_format = str(obj.get("__quant_format__", "turboquant_v2"))
+    if quant_format not in {"turboquant_v2", "turboquant_v3"}:
+        raise ValueError(f"Unsupported TurboQuant artifact format: {quant_format}")
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     quantized = obj["quantized"]
     quant_meta = obj.get("quant_meta", {})
@@ -606,19 +694,63 @@ def dequantize_state_dict_turboquant(obj: dict[str, object]) -> dict[str, Tensor
         rows = int(meta["rows"])
         bits = int(meta["bits"])
         rotation_seed = int(meta["rotation_seed"])
-        row_norm = quantized[f"{name}::row_norm"].float().reshape(rows)
         if kind == "mse":
-            idx = quantized[f"{name}::idx"]
-            q = TurboQuantMSE(dim=dim, bits=bits, rotation_seed=rotation_seed)
-            unit_hat = q.dequantize_batch(idx)
+            if bool(meta.get("blockwise", False)):
+                block_dims = [int(v) for v in meta.get("block_dims", [])]
+                num_blocks = int(meta.get("num_blocks", len(block_dims)))
+                if not block_dims:
+                    raise ValueError(f"Missing block_dims for blockwise tensor: {name}")
+                if num_blocks != len(block_dims):
+                    raise ValueError(
+                        f"num_blocks mismatch for tensor {name}: "
+                        f"num_blocks={num_blocks}, len(block_dims)={len(block_dims)}"
+                    )
+                block_rotation_seeds = [int(v) for v in meta.get("block_rotation_seeds", [])]
+                if len(block_rotation_seeds) != num_blocks:
+                    block_rotation_seeds = [
+                        _stable_name_seed(rotation_seed, f"block_{block_idx}_{block_dim}")
+                        for block_idx, block_dim in enumerate(block_dims)
+                    ]
+                rows_hat = torch.empty((rows, dim), dtype=torch.float32)
+                offset = 0
+                for block_idx, (block_dim, block_rotation_seed) in enumerate(
+                    zip(block_dims, block_rotation_seeds, strict=True)
+                ):
+                    idx_raw = quantized[f"{name}::idx::{block_idx}"]
+                    if bool(meta.get("idx_packed", False)):
+                        idx = _unpack_indices_from_uint8(idx_raw, bits=bits, rows=rows, dim=block_dim)
+                    else:
+                        idx = idx_raw
+                    q = TurboQuantMSE(dim=block_dim, bits=bits, rotation_seed=block_rotation_seed)
+                    unit_hat = q.dequantize_batch(idx)
+                    block_row_norm = quantized[f"{name}::row_norm::{block_idx}"].float().reshape(rows)
+                    rows_hat[:, offset : offset + block_dim] = block_row_norm[:, None] * unit_hat
+                    offset += block_dim
+                if offset != dim:
+                    raise ValueError(f"Block dims do not cover tensor dimension for {name}: {offset} != {dim}")
+            else:
+                row_norm = quantized[f"{name}::row_norm"].float().reshape(rows)
+                idx_raw = quantized[f"{name}::idx"]
+                if bool(meta.get("idx_packed", False)):
+                    idx = _unpack_indices_from_uint8(idx_raw, bits=bits, rows=rows, dim=dim)
+                else:
+                    idx = idx_raw
+                q = TurboQuantMSE(dim=dim, bits=bits, rotation_seed=rotation_seed)
+                unit_hat = q.dequantize_batch(idx)
+                rows_hat = row_norm[:, None] * unit_hat
         else:
-            idx = quantized[f"{name}::idx"]
+            row_norm = quantized[f"{name}::row_norm"].float().reshape(rows)
+            idx_raw = quantized[f"{name}::idx"]
+            if bool(meta.get("idx_packed", False)):
+                idx = _unpack_indices_from_uint8(idx_raw, bits=bits - 1, rows=rows, dim=dim)
+            else:
+                idx = idx_raw
             qjl = quantized[f"{name}::qjl"]
             gamma = quantized[f"{name}::gamma"].float().reshape(rows)
             qjl_seed = int(meta["qjl_seed"])
             q = TurboQuantProd(dim=dim, bits=bits, rotation_seed=rotation_seed, qjl_seed=qjl_seed)
             unit_hat = q.dequantize_batch({"idx": idx, "qjl": qjl, "gamma": gamma})
-        rows_hat = row_norm[:, None] * unit_hat
+            rows_hat = row_norm[:, None] * unit_hat
         restored = rows_hat.reshape(meta["shape"]).to(dtype=dtype).contiguous()
         out[name] = restored
     for name, t in obj["passthrough"].items():
@@ -1285,6 +1417,7 @@ def main() -> None:
         base_model.state_dict(),
         bits=TURBOQUANT_DEFAULT_BITS,
         mode=TURBOQUANT_DEFAULT_MODE,
+        block_size=TURBOQUANT_DEFAULT_BLOCK_SIZE,
         rotation_seed=args.seed,
         qjl_seed=args.seed + 1,
     )
